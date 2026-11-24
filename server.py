@@ -12,11 +12,20 @@ CREATE TABLE IF NOT EXISTS friends(a TEXT, b TEXT, PRIMARY KEY(a,b));
 CREATE TABLE IF NOT EXISTS requests(frm TEXT, too TEXT, PRIMARY KEY(frm,too));
 CREATE TABLE IF NOT EXISTS inbox(id INTEGER PRIMARY KEY AUTOINCREMENT, to_uid TEXT, payload TEXT);
 """)
+try:
+    db.execute("ALTER TABLE users ADD COLUMN rec TEXT")
+except sqlite3.OperationalError:
+    pass
 online = {}  # uid -> writer
 
 
 def hp(pw, salt):
     return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+def new_code():
+    a = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "-".join("".join(secrets.choice(a) for _ in range(4)) for _ in range(3))
 
 
 def new_uid():
@@ -64,6 +73,8 @@ async def resp(w, ok, *lines, **extra):
 
 async def handle(r, w):
     uid = None
+    fails = 0
+    rec_code = None
     try:
         while True:
             line = await r.readline()
@@ -78,6 +89,22 @@ async def handle(r, w):
             # ---------- auth ----------
             if uid is None:
                 name, pw = (m.get("name") or "").strip(), m.get("pw") or ""
+                if cmd == "reset":
+                    code = (m.get("code") or "").strip().upper()
+                    row = db.execute("SELECT uid,salt,rec FROM users WHERE name=?", (name,)).fetchone()
+                    if not row or not row[2] or not secrets.compare_digest(hp(code, row[1]), row[2]):
+                        fails += 1
+                        await resp(w, False, "Wrong username or recovery code")
+                        if fails >= 5:
+                            break
+                        continue
+                    if len(pw) < 6:
+                        await resp(w, False, "Password must be 6+ chars"); continue
+                    salt, rc = secrets.token_hex(16), new_code()
+                    db.execute("UPDATE users SET salt=?,hash=?,rec=? WHERE uid=?", (salt, hp(pw, salt), hp(rc, salt), row[0]))
+                    db.commit()
+                    await send(w, {"type": "reset", "ok": True, "recovery": rc, "lines": ["Password changed"]})
+                    continue
                 if cmd == "signup":
                     if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", name):
                         await resp(w, False, "Username: 3-20 letters/numbers/_"); continue
@@ -87,12 +114,18 @@ async def handle(r, w):
                         await resp(w, False, "Username taken"); continue
                     salt = secrets.token_hex(16)
                     uid = new_uid()
-                    db.execute("INSERT INTO users VALUES(?,?,?,?,?)", (uid, name, salt, hp(pw, salt), time.time()))
+                    rec_code = new_code()
+                    db.execute("INSERT INTO users(uid,name,salt,hash,created,rec) VALUES(?,?,?,?,?,?)",
+                               (uid, name, salt, hp(pw, salt), time.time(), hp(rec_code, salt)))
                     db.commit()
                 elif cmd == "login":
                     row = db.execute("SELECT uid,salt,hash FROM users WHERE name=?", (name,)).fetchone()
                     if not row or not secrets.compare_digest(hp(pw, row[1]), row[2]):
-                        await resp(w, False, "Wrong username or password"); continue
+                        fails += 1
+                        await resp(w, False, "Wrong username or password")
+                        if fails >= 5:
+                            break
+                        continue
                     uid = row[0]
                 else:
                     await resp(w, False, "Login or signup first"); continue
@@ -100,7 +133,7 @@ async def handle(r, w):
                     try: online[uid].close()
                     except Exception: pass
                 online[uid] = w
-                await send(w, {"type": "auth", "ok": True, "uid": uid, "name": name_of(uid)})
+                await send(w, {"type": "auth", "ok": True, "uid": uid, "name": name_of(uid), "recovery": rec_code})
                 for row in db.execute("SELECT id,payload FROM inbox WHERE to_uid=? ORDER BY id", (uid,)).fetchall():
                     await send(w, json.loads(row[1]))
                     db.execute("DELETE FROM inbox WHERE id=?", (row[0],))
