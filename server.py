@@ -211,7 +211,7 @@ async def handle(r, w):
 
 async def main():
     srv = await asyncio.start_server(handle, "0.0.0.0", PORT, limit=40 * 1024 * 1024)
-    print(f"[DISTRICT_9] server up on port {PORT}")
+    print(f"[DISTRICT_9] v2 recovery - server up on port {PORT}")
     async with srv:
         await srv.serve_forever()
 
